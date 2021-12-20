@@ -1,0 +1,1 @@
+{"data_dir": "path to data directory", "metadata_file": "path to metadata csv file", "output_dir": "path to main output dorectory (run directory will be created in it)"}
