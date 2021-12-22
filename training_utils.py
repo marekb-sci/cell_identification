@@ -6,15 +6,17 @@ import timm
 
 #%%
 class CheckpointSaver:
-    def __init__(self, save_path, device):
-        self.save_path = save_path # you may use '/path/to_file/best_{score:0.2f}.pt' to dynamically include score in filename
+    def __init__(self, get_save_path, device):
         self.best = None
         self.device = device
+
+        self.get_save_path = get_save_path
+
 
     def save_if_best(self, model, score):
         if self.best is None or score>=self.best:
             self.best = score
-            output_path = self.save_path.format(score=score)
+            output_path = self.get_save_path(score)
             torch.save(model.cpu().state_dict(), output_path)
             model.to(self.device)
             return True
@@ -27,6 +29,13 @@ def get_timm_model(model_config):
                               num_classes = model_config['num_classes'],
                               in_chans = model_config['in_chans'],
                               pretrained = model_config['pretrained'])
+
+    if model_config.get('initial_dropout') is not None:
+        model.conv1 = torch.nn.Sequential(
+            torch.nn.Dropout2d(model_config['initial_dropout']),
+            model.conv1
+            )
+
     return model
 
 #%%
