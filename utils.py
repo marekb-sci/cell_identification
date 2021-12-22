@@ -86,7 +86,6 @@ def plot_confusion_matrix(cm, class_names):
   plt.xlabel('Predicted label')
   return figure
 
-
 def log_figure(logger, fig, image_label='', epoch=0):
     """https://stackoverflow.com/questions/57316491/how-to-convert-matplotlib-figure-to-pil-image-object-without-saving-image"""
     buf = io.BytesIO()
