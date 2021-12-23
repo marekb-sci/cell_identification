@@ -25,16 +25,25 @@ class CheckpointSaver:
 #%%
 
 def get_timm_model(model_config):
+
+    if model_config['reduce_channels']:
+        timm_in_chans = 3
+    else:
+        timm_in_chans = model_config['in_chans']
     model = timm.create_model(model_config['name'],
                               num_classes = model_config['num_classes'],
-                              in_chans = model_config['in_chans'],
-                              pretrained = model_config['pretrained'])
+                              in_chans = timm_in_chans,
+                              pretrained = model_config['pretrained'],
+                              **model_config['timm_kwargs'])
+
+    first_layer = [model.conv1]
+    if model_config['reduce_channels']:
+        first_layer.insert(0, torch.nn.Conv2d(model_config['in_chans'], 3, 1))
 
     if model_config.get('initial_dropout') is not None:
-        model.conv1 = torch.nn.Sequential(
-            torch.nn.Dropout2d(model_config['initial_dropout']),
-            model.conv1
-            )
+        first_layer.insert(0, torch.nn.Dropout2d(model_config['initial_dropout']))
+
+    model.conv1 = torch.nn.Sequential(*first_layer)
 
     return model
 

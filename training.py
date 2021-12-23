@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
+import numpy as np
 import torch
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from torch.utils import tensorboard
@@ -24,21 +25,28 @@ config = {
         'k_folds': 5,
         'normalization': [('Normalize', {'mean': 0, 'std':1000})], # []
         'transform_train': AUGMENTATIONS['flips']+AUGMENTATIONS['affine']+AUGMENTATIONS['crop32'],
-        'transform_test': AUGMENTATIONS['crop32']
+        'transform_test': AUGMENTATIONS['crop32'],
+        'channels': {
+            'channels_file': PATHS['channels_file'],
+            'upper_value': 1200, #'inf' for no upper value
+            'lower_value': 800 #'-inf' for no lower value
+            }
         },
     'model': {
         'name': 'resnet18',
         'num_classes': 2,
         'in_chans': 1024,
         'pretrained': True,
-        'initial_dropout': 0.1
+        'initial_dropout': 0.0,
+        'reduce_channels': True,
+        'timm_kwargs': {}
         #TODO: add weights path
         },
     'training': {
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'dataloader_workers': 4,
         'batch_size': 32,
-        'num_epochs': 100,
+        'num_epochs': 400,
         'max_epoch_length': None, #None for use all
         'optimizer': {
             'type': 'AdamW',
@@ -46,14 +54,14 @@ config = {
             },
         'lr_scheduler': {
             'type': 'StepLR', #OneCycleLR
-            'kwargs': {'step_size': 3, 'gamma': 0.93},
-            'warm-up_epochs': 10
+            'kwargs': {'step_size': 3, 'gamma': 0.97},
+            'warm-up_epochs': 100
             },
         'criterion': {
             'type': 'cross_entropy'
             },
         'output': {
-            'logging_step': 100,
+            'logging_step': 200,
             'output_dir': None,
             # 'weights_path': None,
             'class_names': ['B', 'T']
@@ -64,11 +72,14 @@ config = {
 
 #%%
 def prepare_config(config=config, run_label=None):
+
+    config = deepcopy(config)
+
+    prepare_channels(config)
+
     if run_label is None:
         run_label = f'run_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
 
-
-    config = deepcopy(config)
     if sys.platform == 'win32':
         config['training']['dataloader_workers'] = 0
     config['run_label'] = run_label
@@ -78,6 +89,20 @@ def prepare_config(config=config, run_label=None):
 
     return config
 
+def prepare_channels(config): #modifiy config in place
+
+    # get channel mask and number of input channels
+    if 'channels' in config['data']:
+        channels_values = np.loadtxt(config['data']['channels']['channels_file'])
+        channel_mask = ((channels_values >= float(config['data']['channels']['lower_value'])) & (channels_values <= float(config['data']['channels']['upper_value']))).tolist()
+        in_chans = sum(channel_mask)
+    else: #use all channels
+        channel_mask = None
+        in_chans = 1024
+
+    # apply channel mask and number of input channels
+    config['data']['channel_mask'] = channel_mask
+    config['model']['in_chans'] = in_chans
 
 
 #%%
@@ -89,6 +114,7 @@ def get_fold_datasets(data_config):
     transform_test = get_augmentation_tv(data_config['transform_test']+data_config['normalization'])
 
     data_dir = data_config['data_dir']
+    channel_mask = data_config['channel_mask']
 
     datasets = []
     for train_indices, test_indices in StratifiedKFold(n_splits=data_config['k_folds'], shuffle=True, random_state=0).split(parent_image_labels.index.to_numpy(), parent_image_labels.to_numpy()):
@@ -99,8 +125,8 @@ def get_fold_datasets(data_config):
         metadata_test = metadata.loc[test_mask]
 
         datasets.append({
-            'train': NumpyCropsDataset(data_dir, metadata_train, transform=transform_train),
-            'test': NumpyCropsDataset(data_dir, metadata_test, transform=transform_test)
+            'train': NumpyCropsDataset(data_dir, metadata_train, transform=transform_train, channel_mask=channel_mask),
+            'test': NumpyCropsDataset(data_dir, metadata_test, transform=transform_test, channel_mask=channel_mask)
             })
 
     return datasets

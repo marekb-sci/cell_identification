@@ -40,10 +40,12 @@ class NumpyCropsDataset(torch.utils.data.Dataset):
         'zero': zero_bcg_generator,
         'min': min_bcg_generator,
     }
-    def __init__(self, data_dir, metadata, img_shape=(1024, 48, 48),
+    def __init__(self, data_dir, metadata,
+                 img_shape=(1024, 48, 48), # if channel_mask is given, updates automatically
                  swap_input_axis=True, #for h,w,c input (h,w,c -> c,h,w)
                  transform=None,
                  target_transform=None,
+                 channel_mask=None,
                  indices=None,
                  background_generator='zero',
                  class_names = ['B', 'T']
@@ -64,6 +66,12 @@ class NumpyCropsDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.target_transform = target_transform
 
+        if channel_mask is None:
+            channel_mask = ... #'...' means 'take all channels'
+        else:
+            self.img_shape = tuple([sum(channel_mask), *self.img_shape[1:]]) #update number of channels
+        self.channel_mask = channel_mask
+
         if indices is None:
             indices = np.arange(len(self.metadata))
         self.indices = indices
@@ -83,6 +91,8 @@ class NumpyCropsDataset(torch.utils.data.Dataset):
         img_in = np.load(self.data_dir / fn)
         if self.swap_input_axis:
             img_in = np.moveaxis(img_in, 2, 0)
+        img_in = img_in[self.channel_mask]
+
 
         #generate background and paste input file inside
         if self.background_generator is not None:
