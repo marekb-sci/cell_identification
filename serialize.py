@@ -39,7 +39,7 @@ def load_yaml(fn):
 def parse_mode(mode, fn):
     if mode is None:
         fn = str(fn)
-        if fn.endswith('.pickle'):
+        if fn.endswith('.pickle') or fn.endswith('.pkl'):
             mode = 'pickle'
         elif fn.endswith('.json'):
             mode = 'json'

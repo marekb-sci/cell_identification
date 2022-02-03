@@ -23,12 +23,14 @@ AUGMENTATIONS = {
 
 
 def min_bcg_generator(img_shape, img_in):
-    img_out = np.zeros(img_shape)
+    num_chans = img_in.shape[0]
+    img_out = np.zeros((num_chans, *img_shape))
     img_out[:] = img_in.min(axis=(1,2), keepdims=True)
     return np.full(img_shape, np.median(img_in))
 
 def zero_bcg_generator(img_shape, img_in):
-    return np.zeros(img_shape)
+    num_chans = img_in.shape[0]
+    return np.zeros((num_chans, *img_shape))
 
 
 class NumpyCropsDataset(torch.utils.data.Dataset):
@@ -41,7 +43,7 @@ class NumpyCropsDataset(torch.utils.data.Dataset):
         'min': min_bcg_generator,
     }
     def __init__(self, data_dir, metadata,
-                 img_shape=(1024, 48, 48), # if channel_mask is given, updates automatically
+                 img_shape=(48, 48),
                  swap_input_axis=True, #for h,w,c input (h,w,c -> c,h,w)
                  transform=None,
                  target_transform=None,
@@ -68,8 +70,6 @@ class NumpyCropsDataset(torch.utils.data.Dataset):
 
         if channel_mask is None:
             channel_mask = ... #'...' means 'take all channels'
-        else:
-            self.img_shape = tuple([sum(channel_mask), *self.img_shape[1:]]) #update number of channels
         self.channel_mask = channel_mask
 
         if indices is None:

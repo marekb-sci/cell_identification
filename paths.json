@@ -2,5 +2,5 @@
 "data_dir": "path to data directory",
 "metadata_file": "path to metadata csv file",
 "output_dir": "path to main output dorectory (run directory will be created in it)",
-"channels_file": "path to values of each channel"
+"normalization_file": "path to json file with mean and std for channels"
 }
