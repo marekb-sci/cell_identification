@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
+import os
 
 import torch
-
 import timm
 
 #%%
 class CheckpointSaver:
-    def __init__(self, get_save_path, device):
+    def __init__(self, get_save_path, device, max_saved=5):
+        """
+        get_save_path: function from score to file path
+        device: 'cpu' or 'cuda'
+        max_saved: number of best weights to save
+        """
         self.best = None
         self.device = device
 
         self.get_save_path = get_save_path
-
+        self.max_saved = max_saved
+        self.saved = []
 
     def save_if_best(self, model, score):
         if self.best is None or score>=self.best:
             self.best = score
             output_path = self.get_save_path(score)
             torch.save(model.cpu().state_dict(), output_path)
+            if len(self.saved) == 0 or self.saved[-1] != output_path:
+                self.saved.append(output_path)
+                if len(self.saved) > self.max_saved:
+                    os.remove(self.saved.pop(0))
             model.to(self.device)
             return True
         return False
@@ -33,17 +43,48 @@ def get_timm_model(model_config):
     model = timm.create_model(model_config['name'],
                               num_classes = model_config['num_classes'],
                               in_chans = timm_in_chans,
-                              pretrained = model_config['pretrained_timm'],
+                              pretrained = model_config['pretrained_timm'] and not model_config['pretrained_own'], # load timm weights if requested and if no custom weights will be used
                               **model_config['timm_kwargs'])
 
-    first_layer = [model.conv1]
+    # add layer at the beginning of the network
+    first_layer = [get_first_layer(model)]
     if model_config.get('linear_channels_adapter', False):
         first_layer.insert(0, torch.nn.Conv2d(model_config['in_chans'], 3, 1, bias=False))
+    set_first_layer(model, torch.nn.Sequential(*first_layer)) #model.conv1 = torch.nn.Sequential(*first_layer)
 
-    model.conv1 = torch.nn.Sequential(*first_layer)
-
+    # load weights from file
     if model_config['pretrained_own']:
         model.load_state_dict(torch.load(model_config['weights_path']))
+
+    return model
+
+def get_first_layer(model):
+    stages = list(model.state_dict().keys())[0].split('.')[:-1]
+    out = model
+    for s in stages:
+        if s.isnumeric():
+            out = out[int(s)]
+        else:
+            out = getattr(out, s)
+    return out
+
+def set_first_layer(model, layer):
+    stages = list(model.state_dict().keys())[0].split('.')[:-1]
+
+    parent_module = model
+    for s in stages[:-1]:
+        s = stages[0]
+        if s.isnumeric():
+            parent_module = parent_module[int(s)]
+        else:
+            parent_module = getattr(parent_module, s)
+
+    s = stages[-1]
+
+    if s.isnumeric():
+        parent_module[int(s)] = layer
+    else:
+        setattr(parent_module, s, layer)
 
     return model
 
@@ -56,7 +97,7 @@ def get_optimizer_and_scheduler(model, optimizer_config, scheduler_config):
                                                                **optimizer_config['kwargs'])
     base_scheduler = getattr(torch.optim.lr_scheduler, scheduler_config['type'])(optimizer,
                                                                             **scheduler_config['kwargs'])
-    if scheduler_config['warm-up_epochs'] is None:
+    if scheduler_config['warm-up_epochs'] in [0, None]:
         scheduler = base_scheduler
     else:
         scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=scheduler_config['warm-up_epochs'], after_scheduler=base_scheduler)

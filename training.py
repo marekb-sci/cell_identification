@@ -10,7 +10,7 @@ import sys, os
 from copy import deepcopy
 import torchmetrics
 
-from data import NumpyCropsDataset, AUGMENTATIONS, get_augmentation_tv
+from data import NumpyCropsDataset, NumpyCropToTensor, AUGMENTATIONS, get_augmentation_tv, subsample_pixels
 import training_utils
 from utils import DummyMetric, log_confusion_matrix
 from serialize import load_json, save_json
@@ -18,7 +18,7 @@ from serialize import load_json, save_json
 # add crop 96
 AUGMENTATIONS['crop96'] = [('CenterCrop', {'size': 96})]
 # modify affine (smaller resize)
-AUGMENTATIONS['affine'] = [('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (0.8, 1.2), 'shear': 0})]
+# AUGMENTATIONS['affine'] = [('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (0.8, 1.2), 'shear': 0})]
 
 
 default_config = {
@@ -28,15 +28,25 @@ default_config = {
         'k_folds': 5,
         'normalization_file': None, #set from "paths" file,
         'normalization': None, #if not None, override settings from normalization_file, e.g. [('Normalize', {'mean': 0, 'std':1000})], # []
-        'transform_train': AUGMENTATIONS['flips']+AUGMENTATIONS['affine']+AUGMENTATIONS['crop96'],
-        'transform_test': AUGMENTATIONS['crop96'],
-        'class_names': ['Jurkat', 'THP-1'],
-        'dataset_kwargs' : {'img_shape': (128, 128)}
+        'transform_train': AUGMENTATIONS['flips']+[('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (1, 2), 'shear': 0})]+AUGMENTATIONS['crop32'],
+        'transform_test': AUGMENTATIONS['crop32'],
+        'channels': {
+            'mode': 'interval', # 'mask', 'interval', 'all' ('all' == use all channels)
+            'upper_value': 1200, #'inf' for no upper value
+            'lower_value': 800, #'-inf' for no lower value
+            'mask': None # list [True, False, ...] with True/False for each channel, where True indicate which channels will be used. Override mask from channel_mask_file
+            },
+        'subsample_pixels': { #use image at lower resolution (1/2)
+            'train': False,
+            'test': False
+            },
+        'class_names': ['Jurkat', 'RPMI8226'], #['Jurkat', 'RPMI8226'], ['B', 'T']
+        'dataset_kwargs' : {'img_shape': (48, 48)}
         },
     'model': {
         'name': 'resnet18',
         'num_classes': 2,
-        'in_chans': 2,
+        'in_chans': 1011,
         'pretrained_timm': True,
         'timm_kwargs': {},
         'linear_channels_adapter': True, #add initial linear layer mapping channels to RGB
@@ -59,7 +69,8 @@ default_config = {
             'warm-up_epochs': 100
             },
         'criterion': {
-            'type': 'cross_entropy'
+            'type': 'cross_entropy',
+            # 'kwargs': {'label_smoothing': 0.1} #'label_smoothing' requires at least pytorch 1.10
             },
         'output': {
             'logging_step': 200,
@@ -75,6 +86,8 @@ default_config = {
 def prepare_config(paths, config=default_config, run_label=None):
 
     config = deepcopy(config)
+    if 'channels' in config['data']:
+        prepare_channels(config, paths.get('channels_file'), paths.get('channels_mask_file'))
 
     #set run_label
     if run_label is None:
@@ -97,6 +110,14 @@ def prepare_config(paths, config=default_config, run_label=None):
     if config['data']['normalization'] is None:
         normalization_settings = load_json(config['data']['normalization_file'])
         config['data']['normalization'] = [('Normalize', normalization_settings)]
+    if config['data']['channel_mask'] is not None: # ajust normalizaion to reduced number of channels
+        channel_mask = np.array(config['data']['channel_mask'])
+        mean = np.array(config['data']['normalization'][0][1]['mean'])
+        std = np.array(config['data']['normalization'][0][1]['std'])
+        if len(mean) == len(channel_mask):
+            config['data']['normalization'][0][1]['mean'] = mean[channel_mask].tolist()
+        if len(std) == len(channel_mask):
+            config['data']['normalization'][0][1]['std'] = std[channel_mask].tolist()
 
     # propagate values in config
     config['training']['output']['class_names'] = config['data']['class_names']
@@ -107,12 +128,54 @@ def prepare_config(paths, config=default_config, run_label=None):
 
     return config
 
+def prepare_channels(config, channels_file, channels_mask_file): #modifiy config in place
+
+    if config['data']['channels']['mode'] == 'all':
+        channel_mask = None
+
+    elif config['data']['channels']['mode'] == 'mask':
+        if config['data']['channels'] is not None:
+            channel_mask = config['data']['channels']
+        else:
+            channel_mask = np.load(channels_mask_file).tolist()
+
+    elif config['data']['channels']['mode'] == 'interval':
+        channels_values = np.loadtxt(channels_file)
+        channel_mask = ((channels_values >= float(config['data']['channels']['lower_value'])) & (channels_values <= float(config['data']['channels']['upper_value']))).tolist()
+    else:
+        raise NotImplementedError()
+
+    # apply channel mask and number of input channels
+    config['data']['channel_mask'] = channel_mask
+    if channel_mask is not None:
+        config['model']['in_chans'] = sum(channel_mask)
+
 #%%
+
+def generate_data_splits(metadata, n_splits, one_image_one_dataset=False):
+    """one_image_one_dataset: put data cropped from the same image to the same dataset"""
+    if one_image_one_dataset:
+        return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0).split(np.arange(len(metadata)), metadata['label'].to_numpy())
+
+    parent_image_labels = metadata.groupby('parent_image').first()['label']
+    indices_all = np.arange(len(metadata))
+
+    splits = []
+    for img_train_indices, img_test_indices in StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0).split(parent_image_labels.index.to_numpy(), parent_image_labels.to_numpy()):
+        test_parent_imgs = parent_image_labels.index[img_test_indices]
+
+        test_mask = metadata.parent_image.isin(test_parent_imgs)
+        train_indices = indices_all[~test_mask]
+        test_indices = indices_all[test_mask]
+        splits.append([train_indices, test_indices])
+
+    return splits
+
 
 def create_folds_configs(config):
     metadata = pd.read_csv(config['data']['metadata_file'])
 
-    data_split = StratifiedKFold(n_splits=config['data']['k_folds'], shuffle=True, random_state=0).split(np.arange(len(metadata)), metadata['label'].to_numpy())
+    data_split = generate_data_splits(metadata, config['data']['k_folds']) #StratifiedKFold(n_splits=config['data']['k_folds'], shuffle=True, random_state=0).split(np.arange(len(metadata)), metadata['label'].to_numpy())
 
     folds_configs = []
     for i_fold, (train_indices, test_indices) in enumerate(data_split):
@@ -139,9 +202,13 @@ def get_datasets(data_config):
     metadata_test = metadata.iloc[data_config['test_indices']]
 
     datasets = {
-        'train': NumpyCropsDataset(data_dir, metadata_train, transform=transform_train, class_names=data_config['class_names'], **data_config['dataset_kwargs']),
-        'test': NumpyCropsDataset(data_dir, metadata_test, transform=transform_test, class_names=data_config['class_names'], **data_config['dataset_kwargs'])
+        'train': NumpyCropsDataset(data_dir, metadata_train, transform=transform_train, class_names=data_config['class_names'], channel_mask=data_config['channel_mask'], **data_config['dataset_kwargs']),
+        'test': NumpyCropsDataset(data_dir, metadata_test, transform=transform_test, class_names=data_config['class_names'], channel_mask=data_config['channel_mask'], **data_config['dataset_kwargs'])
         }
+
+    for ds_type in ['train', 'test']:
+        if 'subsample_pixels' in data_config and data_config['subsample_pixels'][ds_type]:
+            datasets[ds_type] = subsample_pixels(datasets[ds_type])
 
     return datasets
 
@@ -337,7 +404,7 @@ def run_training(config):
 
         metrics_history.append(metrics_out)
     #END OF TRAINING LOOP
-    weights_file_name = f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_last_{metrics_out["accuracy"]:0.2f}.pt'
+    weights_file_name = f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_last_{metrics_out["val_accuracy"]:0.2f}.pt'
     torch.save(model.cpu().state_dict(), output_dir / weights_file_name)
 
     # tb_logger.add_hparams(get_hparams(config), best_metrics)
@@ -351,7 +418,7 @@ def run_training(config):
 
 #%%
 if __name__=='__main__':
-    paths = load_json('paths_data2.json')
+    paths = load_json('paths_test.json')
     my_config = prepare_config(paths, config=default_config)
 
     #uncomment to test step by step

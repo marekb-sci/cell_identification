@@ -1,6 +1,7 @@
 {
 "data_dir": "path to data directory",
 "metadata_file": "path to metadata csv file",
+"normalization_file": "path to json file with mean and std for channels",
+"channels_file": "path to file with channels frequencies, e.g. Raman_shift_values.txt",
 "output_dir": "path to main output dorectory (run directory will be created in it)",
-"normalization_file": "path to json file with mean and std for channels"
 }
