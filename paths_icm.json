@@ -1,0 +1,1 @@
+{"data_dir": "/scratch/data/03_uw/04_cropped/images", "metadata_file": "/scratch/data/03_uw/04_cropped/info.csv", "output_dir": "/scratch/results", "normalization_file": "/scratch/data/03_uw/04_cropped/normalization.json", "channels_file": "/scratch/data/03_uw/Raman_shift_values.txt", "data_split_file": "/scratch/data/03_uw/04_cropped/data_split_1.json"}

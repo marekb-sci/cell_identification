@@ -3,10 +3,13 @@ from copy import deepcopy
 import numpy as np
 import torch.utils.data as data
 import os
+from copy import deepcopy
 import torch
 import pandas as pd
 from pathlib import Path
 import torchvision
+import pytorch_lightning as pl
+
 
 def get_augmentation_tv(aug_list):
 
@@ -19,8 +22,8 @@ AUGMENTATIONS = {
     'flips': [('RandomHorizontalFlip', {}), ('RandomVerticalFlip', {})],
     'rotation': [('RandomRotation', {'degrees': 45})],
     'affine': [('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (1, 2), 'shear': 0})],
-    'crop32':  [('CenterCrop', {'size': 32})],
-    'crop96':  [('CenterCrop', {'size': 96})]
+    'crop32': [('CenterCrop', {'size': 32})],
+    'crop96': [('CenterCrop', {'size': 96})],
 }
 
 
@@ -154,3 +157,49 @@ def subsample_pixels(ds):
     ds_out = torch.utils.data.ConcatDataset(datasets=datasets)
     ds_out.metadata = ds.metadata
     return ds_out
+
+class NumpyCropsDM(pl.LightningDataModule):
+    def __init__(self, data_config, batch_size=32, num_workers=0):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.setup_data(data_config)
+
+    def setup_data(self, data_config):
+
+        self.data_config = data_config
+
+        metadata = pd.read_csv(data_config['metadata_file'])
+        data_dir = data_config['data_dir']
+
+        self.transform_train = get_augmentation_tv(data_config['transform_train']+data_config['normalization'])
+        self.transform_test = get_augmentation_tv(data_config['transform_test']+data_config['normalization'])
+
+        self.metadata_train = metadata.iloc[data_config['train_indices']]
+        self.metadata_test = metadata.iloc[data_config['test_indices']]
+
+        self.class_names = data_config['class_names']
+        self.channel_mask = data_config['channel_mask']
+
+        self.dataset_train = NumpyCropsDataset(data_dir, self.metadata_train, transform=self.transform_train, class_names=self.class_names, channel_mask=self.channel_mask, **data_config['dataset_kwargs'])
+        self.dataset_val = NumpyCropsDataset(data_dir, self.metadata_test, transform=self.transform_test, class_names=self.class_names, channel_mask=self.channel_mask, **data_config['dataset_kwargs'])
+
+        subsample_pixels_config = data_config.get('subsample_pixels', {'train': False, 'test': False})
+        if subsample_pixels_config['train']:
+            self.dataset_train = subsample_pixels(self.dataset_train)
+        if subsample_pixels_config['test']:
+            self.dataset_val = subsample_pixels(self.dataset_val)
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(self.dataset_train,
+                                           batch_size=self.batch_size,
+                                           shuffle=True,
+                                           num_workers=self.num_workers
+                                           )
+
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(self.dataset_val,
+                                           batch_size=self.batch_size,
+                                           shuffle=False,
+                                           num_workers=self.num_workers
+                                           )

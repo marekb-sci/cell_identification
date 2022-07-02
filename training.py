@@ -9,23 +9,19 @@ from pathlib import Path
 import sys, os
 from copy import deepcopy
 import torchmetrics
+import pytorch_lightning as pl
 
-from data import NumpyCropsDataset, NumpyCropToTensor, AUGMENTATIONS, get_augmentation_tv, subsample_pixels
+
+from data import NumpyCropsDM, AUGMENTATIONS
 import training_utils
 from utils import DummyMetric, log_confusion_matrix
 from serialize import load_json, save_json
-
-# add crop 96
-AUGMENTATIONS['crop96'] = [('CenterCrop', {'size': 96})]
-# modify affine (smaller resize)
-# AUGMENTATIONS['affine'] = [('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (0.8, 1.2), 'shear': 0})]
-
 
 default_config = {
     'data': {
         'data_dir': None,  #set from "paths" file
         'metadata_file': None,  #set from "paths" file
-        'k_folds': 5,
+        'data_spit': None, #set from "paths" file D:/UW/projects/008_komorki_bialaczka/03_dane/03_UW_MLset1/04_cropped/data_split_0.json
         'normalization_file': None, #set from "paths" file,
         'normalization': None, #if not None, override settings from normalization_file, e.g. [('Normalize', {'mean': 0, 'std':1000})], # []
         'transform_train': AUGMENTATIONS['flips']+[('RandomAffine', {'degrees': 45, 'translate': (0.1, 0.1), 'scale': (1, 2), 'shear': 0})]+AUGMENTATIONS['crop32'],
@@ -33,15 +29,16 @@ default_config = {
         'channels': {
             'mode': 'interval', # 'mask', 'interval', 'all' ('all' == use all channels)
             'upper_value': 1200, #'inf' for no upper value
-            'lower_value': 800, #'-inf' for no lower value
-            'mask': None # list [True, False, ...] with True/False for each channel, where True indicate which channels will be used. Override mask from channel_mask_file
+            'lower_value': 800 #'-inf' for no lower value
             },
         'subsample_pixels': { #use image at lower resolution (1/2)
             'train': False,
             'test': False
             },
         'class_names': ['Jurkat', 'RPMI8226'], #['Jurkat', 'RPMI8226'], ['B', 'T']
-        'dataset_kwargs' : {'img_shape': (48, 48)}
+        'dataset_kwargs' : {'img_shape': (48, 48)},
+        'train_indices': None,
+        'test_indices': None
         },
     'model': {
         'name': 'resnet18',
@@ -49,7 +46,11 @@ default_config = {
         'in_chans': 1011,
         'pretrained_timm': True,
         'timm_kwargs': {},
-        'linear_channels_adapter': True, #add initial linear layer mapping channels to RGB
+        'stem': {
+            'timm': 'deep',
+            'extra': 'dense',
+            'extra_kwargs': {'intermediate_chans': [256, 128]}
+            },
         'pretrained_own': False, #True to use own weights (overrides 'pretrained_timm' ),
         'weights_path': None  #set from "paths" file
         },
@@ -58,7 +59,13 @@ default_config = {
         'dataloader_workers': 4,
         'batch_size': 32,
         'num_epochs': 400,
-        'max_epoch_length': None, #None for use all
+        'trainer_kwargs': {
+            'accumulate_grad_batches': 1,
+            'gpus': 1, 'auto_select_gpus': True,
+            'gradient_clip_val': 0.5, #'gradient_clip_algorithm': 'value', #https://pytorch-lightning.readthedocs.io/en/latest/advanced/training_tricks.html#gradient-clipping
+            'precision': 16
+            },
+        # 'max_epoch_length': None, #None for use all
         'optimizer': {
             'type': 'AdamW',
             'kwargs': {'lr': 0.001}
@@ -82,6 +89,7 @@ default_config = {
     'output_dir': None #set from "paths" file
     }
 
+
 #%%
 def prepare_config(paths, config=default_config, run_label=None):
 
@@ -102,6 +110,7 @@ def prepare_config(paths, config=default_config, run_label=None):
     config['data']['data_dir'] = paths['data_dir']
     config['data']['metadata_file'] = paths['metadata_file']
     config['data']['normalization_file'] = paths.get('normalization_file')
+    config['data']['data_split_file'] = paths.get('data_split_file')
 
     if config['model']['pretrained_own']:
         config['model']['weights_path'] = paths['weights_path']
@@ -110,6 +119,11 @@ def prepare_config(paths, config=default_config, run_label=None):
     if config['data']['normalization'] is None:
         normalization_settings = load_json(config['data']['normalization_file'])
         config['data']['normalization'] = [('Normalize', normalization_settings)]
+    if config['data']['data_split_file'] is not None:
+        data_split = load_json(config['data']['data_split_file'])
+        config['data']['train_indices'] = data_split['train_indices']
+        config['data']['test_indices'] = data_split['test_indices']
+
     if config['data']['channel_mask'] is not None: # ajust normalizaion to reduced number of channels
         channel_mask = np.array(config['data']['channel_mask'])
         mean = np.array(config['data']['normalization'][0][1]['mean'])
@@ -134,10 +148,7 @@ def prepare_channels(config, channels_file, channels_mask_file): #modifiy config
         channel_mask = None
 
     elif config['data']['channels']['mode'] == 'mask':
-        if config['data']['channels'] is not None:
-            channel_mask = config['data']['channels']
-        else:
-            channel_mask = np.load(channels_mask_file).tolist()
+        channel_mask = np.load(channels_mask_file).tolist()
 
     elif config['data']['channels']['mode'] == 'interval':
         channels_values = np.loadtxt(channels_file)
@@ -150,284 +161,143 @@ def prepare_channels(config, channels_file, channels_mask_file): #modifiy config
     if channel_mask is not None:
         config['model']['in_chans'] = sum(channel_mask)
 
-#%%
-
-def generate_data_splits(metadata, n_splits, one_image_one_dataset=False):
-    """one_image_one_dataset: put data cropped from the same image to the same dataset"""
-    if one_image_one_dataset:
-        return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0).split(np.arange(len(metadata)), metadata['label'].to_numpy())
-
-    parent_image_labels = metadata.groupby('parent_image').first()['label']
-    indices_all = np.arange(len(metadata))
-
-    splits = []
-    for img_train_indices, img_test_indices in StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0).split(parent_image_labels.index.to_numpy(), parent_image_labels.to_numpy()):
-        test_parent_imgs = parent_image_labels.index[img_test_indices]
-
-        test_mask = metadata.parent_image.isin(test_parent_imgs)
-        train_indices = indices_all[~test_mask]
-        test_indices = indices_all[test_mask]
-        splits.append([train_indices, test_indices])
-
-    return splits
-
-
-def create_folds_configs(config):
-    metadata = pd.read_csv(config['data']['metadata_file'])
-
-    data_split = generate_data_splits(metadata, config['data']['k_folds']) #StratifiedKFold(n_splits=config['data']['k_folds'], shuffle=True, random_state=0).split(np.arange(len(metadata)), metadata['label'].to_numpy())
-
-    folds_configs = []
-    for i_fold, (train_indices, test_indices) in enumerate(data_split):
-        fold_config = deepcopy(config)
-
-        fold_config['data']['train_indices'] = train_indices.tolist()
-        fold_config['data']['test_indices'] = test_indices.tolist()
-
-        fold_config['training']['suffix'] = f' {i_fold}' #this will be added to logged values (e.g. 'loss 2') and weight file names
-
-        folds_configs.append(fold_config)
-
-    return folds_configs
-
-def get_datasets(data_config):
-    metadata = pd.read_csv(data_config['metadata_file'])
-
-    transform_train = get_augmentation_tv(data_config['transform_train']+data_config['normalization'])
-    transform_test = get_augmentation_tv(data_config['transform_test']+data_config['normalization'])
-
-    data_dir = data_config['data_dir']
-
-    metadata_train = metadata.iloc[data_config['train_indices']]
-    metadata_test = metadata.iloc[data_config['test_indices']]
-
-    datasets = {
-        'train': NumpyCropsDataset(data_dir, metadata_train, transform=transform_train, class_names=data_config['class_names'], channel_mask=data_config['channel_mask'], **data_config['dataset_kwargs']),
-        'test': NumpyCropsDataset(data_dir, metadata_test, transform=transform_test, class_names=data_config['class_names'], channel_mask=data_config['channel_mask'], **data_config['dataset_kwargs'])
-        }
-
-    for ds_type in ['train', 'test']:
-        if 'subsample_pixels' in data_config and data_config['subsample_pixels'][ds_type]:
-            datasets[ds_type] = subsample_pixels(datasets[ds_type])
-
-    return datasets
-
-#%%
-def train_one_epoch(model, data_loader, criterion, optimizer, scheduler, train_config, tb_logger, metrics, state):
-    device = train_config['device']
-    model.train()
-    trainng_steps_beginning = state['training_steps']
-    suffix = state.get('suffix', '')
-
-    tb_logger.add_scalars('lr', {f'lr{suffix}': optimizer.param_groups[0]['lr']}, state['training_steps'])
-    for x, target in data_loader:
-        target = target.to(device)
-        y = model(x.to(device))
-        loss = criterion(y, target)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        state['training_steps'] += len(target)
-        metrics['loss'](loss, len(target))
-        metrics['accuracy'](y.softmax(dim=-1), target)
-        metrics['confusion matrix'](y.softmax(dim=-1), target)
-
-        if state['training_steps'] - state['last_log'] >= train_config['output']['logging_step']:
-            state['last_log'] = state['training_steps']
-
-            #logging
-            tb_logger.add_scalars('loss', {f'train{suffix}': metrics['loss'].compute()}, state['training_steps'])
-            tb_logger.add_scalars('accuracy', {f'train{suffix}': metrics['accuracy'].compute()}, state['training_steps'])
-            log_confusion_matrix(metrics['confusion matrix'].compute().cpu().numpy(),
-                     tb_logger, class_names=train_config['output'].get('class_names'),
-                     num_classes = metrics['confusion matrix'].num_classes,
-                     image_label=f'train confusion matrix{suffix}', epoch=state['training_steps'])
-
-            tb_logger.flush()
-
-            metrics['loss'].reset()
-            metrics['accuracy'].reset()
-            metrics['confusion matrix'].reset()
-
-        if train_config['max_epoch_length'] is not None and state['training_steps'] - trainng_steps_beginning >= train_config['max_epoch_length']:
-            break
-
-    if scheduler is not None:
-        scheduler.step()
-
-    return state
-
 
 #%%
 
-@torch.no_grad()
-def validate(model, data_loader, criterion, train_config, tb_logger, metrics, state):
-    device = train_config['device']
-    model.eval()
-    for x, target in data_loader:
-        target = target.to(device)
-        y = model(x.to(device))
-        loss = criterion(y, target)
+class ParticlesClassifier(pl.LightningModule):
 
-        metrics['loss'](loss, len(x))
-        metrics['accuracy'](y.softmax(dim=-1), target)
-        metrics['confusion matrix'](y.softmax(dim=-1), target)
+    def __init__(self, config):
+        super().__init__()
 
-    #logging
-    val_metrics = {'loss': metrics['loss'].compute(),  'accuracy': metrics['accuracy'].compute(),
-                   'cm': metrics['confusion matrix'].compute().cpu().numpy()}
 
-    suffix = state.get('suffix', '')
-    tb_logger.add_scalars('loss',  {f'val{suffix}': val_metrics['loss']}, state['training_steps'])
-    tb_logger.add_scalars('accuracy', {f'val{suffix}': val_metrics['accuracy']}, state['training_steps'])
+        self.model = training_utils.get_model(config['model'])
 
-    class_names = train_config['output'].get('class_names')
-    log_confusion_matrix(val_metrics['cm'],
-                         tb_logger, class_names=class_names,
-                         num_classes = metrics['confusion matrix'].num_classes,
-                         image_label=f'val confusion matrix{suffix}', epoch=state['epoch'])
+        self.optimizer_config = config['training']['optimizer']
+        self.lr_scheduler_config = config['training']['lr_scheduler']
 
-    tb_logger.flush()
+        self.criterion = training_utils.get_criterion(config['training']['criterion'])
 
-    metrics['accuracy'].reset()
-    metrics['loss'].reset()
-    metrics['confusion matrix'].reset()
+        self.setup_metrics(num_classes=config['model']['num_classes'])
+        self.class_names = config['training']['output'].get('class_names')
 
-    return val_metrics
 
-#%%
+    def forward(self, x):
+        y = self.model(x)
+        return y
 
-def run_kfold_training(config):
-    output_dir = Path(config['training']['output']['output_dir'])
-    output_dir.mkdir(exist_ok=True, parents=True)
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        p = self.model(x)
+        loss = self.criterion(p, y)
+        self.update_metrics(loss, y, p)
 
-    save_json(config, output_dir / f'{config["run_label"]}_kfold_config.json')
+        return {'loss': loss}
 
-    folds_configs = create_folds_configs(config)
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        p = self.model(x)
+        loss = self.criterion(p, y)
+        self.update_metrics(loss, y, p)
 
-    results = []
-    for fold_config in folds_configs:
-        fold_result = run_training(fold_config)
-        results.append(fold_result)
+        return {'loss': loss}
 
-    test_acc_sum = 0
-    test_acc_weight = 0
-    for fold_result, fold_config in zip(results, folds_configs):
-        weight = len(fold_config['data']['test_indices'])
-        test_acc_sum += weight * fold_result[-1]['val_accuracy']
-        test_acc_weight += weight
-    test_acc = test_acc_sum / test_acc_weight
-    print(f'overal test accuracy: {test_acc:0.4f}')
 
-    return results
+    def setup_metrics(self, num_classes):
+            self.metrics = {
+                'accuracy': torchmetrics.Accuracy(),
+                'loss': DummyMetric(),
+                'confusion matrix': torchmetrics.ConfusionMatrix(
+                    num_classes=num_classes, normalize='none' #'true'
+                    )
+                }
 
-def run_training(config):
+    @torch.no_grad()
+    def update_metrics(self, loss, y, y_hat):
+        loss, y, y_hat = loss.cpu().float(), y.cpu() , y_hat.cpu().float()
+        self.metrics['loss'](loss, len(y))
+        self.metrics['accuracy'](y_hat.softmax(dim=-1), y)
+        self.metrics['confusion matrix'](y_hat.softmax(dim=-1), y)
 
-    output_dir = Path(config['training']['output']['output_dir'])
-    output_dir.mkdir(exist_ok=True, parents=True)
-    config_file_name = f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_config.json'
-    save_json(config, output_dir / config_file_name)
 
-    datasets = get_datasets(config['data'])
-    ds_train = datasets['train']
-    ds_val = datasets['test']
+    def log_metrics(self, prefix='', reset=False):
+        metrics = {}
+        for label, metric in self.metrics.items():
+             #must be logged in different way
+            metric_value = metric.compute()
 
-    dl_train = torch.utils.data.DataLoader(ds_train, shuffle=True,
-                                           batch_size=config['training']['batch_size'],
-                                           pin_memory=True,
-                                           num_workers=config['training']['dataloader_workers'],
-                                           drop_last=True #for timm with 32x32 or smaller input, error occures when batch of size 1 is given in training mode
-                                           )
+            if label == 'confusion matrix':
+                log_confusion_matrix(
+                    metric_value.cpu().numpy(),
+                    self.logger.experiment,
+                    class_names = self.class_names,
+                    num_classes = metric.num_classes,
+                    image_label = f'{prefix}confusion matrix',
+                    epoch = self.current_epoch) #self.global_step)
+            else:
+                self.log(f'{prefix}{label}', metric_value)
+                metrics[f'{prefix}{label}'] = metric.compute()
+            if reset:
+                metric.reset()
 
-    dl_val = torch.utils.data.DataLoader(ds_val, shuffle=False,
-                                       batch_size=config['training']['batch_size'],
-                                       pin_memory=True,
-                                       num_workers=config['training']['dataloader_workers']
-                                       )
+        return metrics
 
-    model = training_utils.get_timm_model(config['model'])
+    def training_epoch_end(self, training_step_outputs):
+        self.log_metrics(prefix='train_', reset=True)
 
-    optimizer, scheduler = training_utils.get_optimizer_and_scheduler(model,
-                                                       config['training']['optimizer'],
-                                                       config['training']['lr_scheduler'])
-    criterion = training_utils.get_criterion(config['training']['criterion'])
+    def validation_epoch_end(self, validation_step_outputs):
+        self.log_metrics(prefix='val_', reset=True)
+        # self.logger.log_hyperparams(self.hparams, metrics)
 
-    train_metrics = {
-        'accuracy': torchmetrics.Accuracy().to(config['training']['device']),
-        'loss': DummyMetric().to(config['training']['device']),
-        'confusion matrix': torchmetrics.ConfusionMatrix(
-            num_classes=config['model']['num_classes'], normalize='none' #'true'
-            ).to(config['training']['device'])
-        }
+    def configure_optimizers(self):
+        # for multi stage training: https://forums.pytorchlightning.ai/t/what-is-the-best-way-to-train-on-stages/95/2
 
-    val_metrics = {
-        'accuracy': torchmetrics.Accuracy().to(config['training']['device']),
-        'loss': DummyMetric().to(config['training']['device']),
-        'confusion matrix': torchmetrics.ConfusionMatrix(
-            num_classes=config['model']['num_classes'], normalize='none' #'true'
-            ).to(config['training']['device'])
-        }
+        optimizer, scheduler = training_utils.get_optimizer_and_scheduler(
+            self.model,
+            self.optimizer_config,
+            self.lr_scheduler_config
+            )
 
-    tb_logger = tensorboard.SummaryWriter(config['training']['output']['output_dir'])
-    checkpoint_saver = training_utils.CheckpointSaver(
-        lambda score: os.path.join(config['training']['output']['output_dir'], f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_best_{score:0.2f}.pt'),
-        config['training']['device']
-        )
+        return [optimizer], [scheduler]
 
-    model = model.to(config['training']['device'])
-    state = {'training_steps': 0, 'epoch': None, 'last_log': 0, 'suffix': config['training']['suffix']}
-    metrics_history = []
-    # best_metrics = None
-    time_start = datetime.datetime.now()
-    #TRAINING LOOP
-    for i_epoch in range(config['training']['num_epochs']):
-        state['epoch'] = i_epoch
-        state = train_one_epoch(model, dl_train, criterion, optimizer, scheduler, config['training'], tb_logger, train_metrics, state)
-        val_metrics_values = validate(model, dl_val, criterion, config['training'], tb_logger, val_metrics, state)
+    def load_weights_from_ckpt(self, ckpt_path):
+        ckpt = torch.load(ckpt_path)
+        self.load_state_dict(ckpt['state_dict'])
 
-        # save weights if best so far
-        is_best = checkpoint_saver.save_if_best(model, val_metrics_values['accuracy'])
 
-        #prepare metrics for logging
-        metrics_out = {'val_accuracy': val_metrics_values['accuracy'].cpu().item(),
-                       'val_loss': val_metrics_values['loss'].cpu().item(),
-                       'time': (datetime.datetime.now() - time_start).total_seconds(),
-                       'num_epoch': i_epoch
-                       }
-        # #test evaluation for best
-        # if is_best:
-        #     test_metrics = validate(model, dl_test, criterion, config['training'], tb_logger, metrics, state)
-        #     metrics_out['test_accuracy'] = test_metrics['accuracy'].cpu().item()
-        #     metrics_out['test_loss'] = test_metrics['loss'].cpu().item()
-        #     best_metrics = metrics_out
-
-        metrics_history.append(metrics_out)
-    #END OF TRAINING LOOP
-    weights_file_name = f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_last_{metrics_out["val_accuracy"]:0.2f}.pt'
-    torch.save(model.cpu().state_dict(), output_dir / weights_file_name)
-
-    # tb_logger.add_hparams(get_hparams(config), best_metrics)
-    tb_logger.close()
-
-    #save metrics to json
-    metrics_file_name = f'{config["run_label"]}{config["training"]["suffix"].replace(" ","_")}_results.json'
-    save_json(metrics_history, output_dir / metrics_file_name)
-
-    return metrics_history
 
 #%%
 if __name__=='__main__':
-    paths = load_json('paths_test.json')
-    my_config = prepare_config(paths, config=default_config)
+
+    default_paths = load_json('default_paths.json')
+    my_config = prepare_config(default_paths, config=default_config)
 
     #uncomment to test step by step
     # fold_configs = create_folds_configs(my_config)
     # datasets = get_datasets(fold_configs[0]['data'])
     # model = training_utils.get_timm_model(fold_configs[0]['model'])
 
-    training_output = run_kfold_training(my_config)
-    save_json(training_output, os.path.join(my_config['output_dir'], 'training_output.json'))
+    data_module = NumpyCropsDM(my_config['data'])
+    model = ParticlesClassifier(my_config)
+
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor='val_loss', save_top_k=3, save_last=True)
+    logger_dir, logger_name = os.path.split(my_config['output_dir'])
+
+    trainer = pl.Trainer(
+        callbacks=[checkpoint_callback],
+        # default_root_dir = Config.log_dir,
+        logger = pl.loggers.TensorBoardLogger(logger_dir, name=logger_name, default_hp_metric=False),
+        max_epochs = my_config['training']['num_epochs'],
+        **my_config['training']['trainer_kwargs']
+        )
+    # trainer = Trainer(default_root_dir='/your/path/to/save/checkpoints')
+
+    save_json(my_config, Path(trainer.log_dir) / 'config.json')
+    trainer.fit(model, datamodule=data_module)
+
+
+
+    # training_output = run_kfold_training(my_config)
+    # save_json(training_output, os.path.join(my_config['output_dir'], 'training_output.json'))
 
 
 

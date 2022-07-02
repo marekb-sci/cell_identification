@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
+import os
 import json
 import pickle
 import yaml
@@ -9,14 +9,17 @@ except ImportError:
     from yaml import Loader, Dumper
 
 def save_pickle(obj, fn):
+    provide_parent(fn)
     with open(fn, 'wb') as f:
         pickle.dump(obj, f)
 
 def save_json(obj, fn):
+    provide_parent(fn)
     with open(fn, 'w') as f:
         json.dump(obj, f)
 
 def save_yaml(obj, fn):
+    provide_parent(fn)
     with open(fn, 'w') as f:
         yaml.dump(obj, f, Dumper=Dumper)
 
@@ -34,6 +37,11 @@ def load_yaml(fn):
     with open(fn) as f:
         obj = yaml.load(f, Loader=Loader)
     return obj
+
+def provide_parent(fn):
+    parent = os.path.split(fn)[0]
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 #%%
 def parse_mode(mode, fn):
